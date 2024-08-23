@@ -11,6 +11,8 @@
 #include "freertos/idf_additions.h"
 #include "soc/soc_caps.h"
 
+// #define DEBUG 1
+
 #define CONFIG_SERVICE_UUID "c22fe686-2ea0-4eb3-8389-d568284e5b10"
 #define DEVICE_NAME_CHARACTERISTIC_UUID "6f5e26b6-5920-4c44-ad4b-3b7893f8ef09"
 #define BATTERY_AMOUNT_CHARACTERISTIC_UUID                                     \
@@ -26,6 +28,8 @@
 #define SENSOR_ADC_CHANNEL_A ADC_CHANNEL_3
 #define SENSOR_ADC_CHANNEL_B ADC_CHANNEL_4
 
+enum TurnDirection { BACKWARD, FORWARD, NONE };
+
 const uint8_t turnStates[] = {
     0b00000000,
     0b00000001,
@@ -33,8 +37,9 @@ const uint8_t turnStates[] = {
     0b00000010,
 };
 
-uint8_t currentTurnState = 0;
-uint8_t currentTurnIndex = 2;
+uint8_t currentTurnIndex = 0;
+TurnDirection lastTurnDirection = TurnDirection::NONE;
+uint8_t turnJitterCounter = 0;
 
 BLEServer *btServer;
 BLEService *configService;
@@ -52,6 +57,11 @@ class ConfigCharacteristicCallbacks : public BLECharacteristicCallbacks {
 };
 
 QueueHandle_t turnPulseNotifyingQueue;
+
+#ifdef DEBUG
+QueueHandle_t debugSensorAQueue;
+QueueHandle_t debugSensorBQueue;
+#endif
 
 static bool IRAM_ATTR
 adcConvDoneCallback(adc_continuous_handle_t handle,
@@ -72,18 +82,21 @@ adcConvDoneCallback(adc_continuous_handle_t handle,
     if (channel == SENSOR_ADC_CHANNEL_A) {
       sensorAState += data;
       countA++;
-      // currentTurnState = (currentTurnState & 0b10) | (data > 600);
     } else {
       sensorBState += data;
       countB++;
-      // currentTurnState = (currentTurnState & 0b01) | ((data > 400) << 1);
     }
   }
 
   sensorAState /= countA;
   sensorBState /= countB;
 
-  currentTurnState = (sensorAState > 500) | ((sensorBState > 300) << 1);
+#ifdef DEBUG
+  xQueueSendToBackFromISR(debugSensorAQueue, &sensorAState, nullptr);
+  xQueueSendToBackFromISR(debugSensorBQueue, &sensorBState, nullptr);
+#endif
+
+  uint8_t currentTurnState = (sensorAState > 500) | ((sensorBState > 250) << 1);
 
   if (currentTurnState == turnStates[(currentTurnIndex + 1) & 3]) {
     currentTurnIndex++;
@@ -91,14 +104,27 @@ adcConvDoneCallback(adc_continuous_handle_t handle,
     currentTurnIndex--;
   }
 
+  TurnDirection turnDirection = TurnDirection::NONE;
+
   if (currentTurnIndex == 255) {
     currentTurnIndex = 3;
-    bool turnDirection = true;
-    xQueueSendToBackFromISR(turnPulseNotifyingQueue, &turnDirection, nullptr);
+    turnDirection = TurnDirection::BACKWARD;
   } else if (currentTurnIndex == 4) {
     currentTurnIndex = 0;
-    bool turnDirection = false;
-    xQueueSendToBackFromISR(turnPulseNotifyingQueue, &turnDirection, nullptr);
+    turnDirection = TurnDirection::FORWARD;
+  }
+
+  if (turnDirection != TurnDirection::NONE) {
+    if (turnDirection != lastTurnDirection) {
+      turnJitterCounter++;
+    } else {
+      turnJitterCounter = 0;
+    }
+    lastTurnDirection = turnDirection;
+
+    if (turnJitterCounter < 3) {
+      xQueueSendToBackFromISR(turnPulseNotifyingQueue, &turnDirection, nullptr);
+    }
   }
 
   return true;
@@ -107,8 +133,6 @@ adcConvDoneCallback(adc_continuous_handle_t handle,
 extern "C" {
 void app_main() {
   BLEDevice::init("Metrino v1");
-
-  ESP_LOGI("sdg", "Balls?");
 
   btServer = BLEDevice::createServer();
 
@@ -151,9 +175,12 @@ void app_main() {
 
   BLEDevice::startAdvertising();
 
-  ESP_LOGI("sdg", "Balls?");
+  turnPulseNotifyingQueue = xQueueCreate(1024, 1);
 
-  turnPulseNotifyingQueue = xQueueCreate(1024, 4);
+#ifdef DEBUG
+  debugSensorAQueue = xQueueCreate(32, 4);
+  debugSensorBQueue = xQueueCreate(32, 4);
+#endif
 
   adc_continuous_handle_t adcDriverHandle = NULL;
 
@@ -195,15 +222,29 @@ void app_main() {
       adc_continuous_register_event_callbacks(adcDriverHandle, &cbs, NULL));
   ESP_ERROR_CHECK(adc_continuous_start(adcDriverHandle));
 
-  int count = 0;
-
   ESP_LOGI("dsg", "ah");
 
   while (true) {
+#ifdef DEBUG
+    unsigned int state;
+
+    if (xQueueReceive(debugSensorAQueue, &state, 1000 / portTICK_PERIOD_MS)) {
+      ESP_LOGI("dsg", "sensor A %u", state);
+    }
+
+    if (xQueueReceive(debugSensorBQueue, &state, 1000 / portTICK_PERIOD_MS)) {
+      ESP_LOGI("dsg", "sensor B %u", state);
+    }
+
+    vTaskDelay(1);
+    continue;
+#endif
+
     uint8_t turnDirection;
+
     if (xQueueReceive(turnPulseNotifyingQueue, &turnDirection,
                       1000 / portTICK_PERIOD_MS)) {
-      ESP_LOGI("dsg", "ah");
+      ESP_LOGI("dsg", "ah %x", turnDirection);
       turnPulseCharacteristic->setValue(turnDirection);
       turnPulseCharacteristic->notify();
     }
