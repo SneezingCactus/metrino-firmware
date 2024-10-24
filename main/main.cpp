@@ -1,10 +1,11 @@
-#include <cstdint>
-#include <cstdio>
 #include <driver/gpio.h>
 #include <driver/ledc.h>
 #include <esp_adc/adc_continuous.h>
 #include <hal/adc_types.h>
 #include <hal/gpio_hal.h>
+
+#include <cstdint>
+#include <cstdio>
 
 #include "NimBLEDevice.h"
 #include "esp_log.h"
@@ -15,12 +16,9 @@
 
 #define CONFIG_SERVICE_UUID "c22fe686-2ea0-4eb3-8389-d568284e5b10"
 #define DEVICE_NAME_CHARACTERISTIC_UUID "6f5e26b6-5920-4c44-ad4b-3b7893f8ef09"
-#define BATTERY_AMOUNT_CHARACTERISTIC_UUID                                     \
-  "0efa935a-9627-4f0b-9e8f-1b86084d2477"
-#define WHEEL_DIAMETER_CHARACTERISTIC_UUID                                     \
-  "63a4b587-33e2-49ba-9c8b-cf0ed8989bae"
-#define WHEEL_DIVISIONS_CHARACTERISTIC_UUID                                    \
-  "9b04682b-7eb0-449b-bd79-419064a43463"
+#define BATTERY_AMOUNT_CHARACTERISTIC_UUID "0efa935a-9627-4f0b-9e8f-1b86084d2477"
+#define WHEEL_DIAMETER_CHARACTERISTIC_UUID "63a4b587-33e2-49ba-9c8b-cf0ed8989bae"
+#define WHEEL_DIVISIONS_CHARACTERISTIC_UUID "9b04682b-7eb0-449b-bd79-419064a43463"
 
 #define OPERATION_SERVICE_UUID "0331e722-6d35-4922-8c69-f80d0f9fb9e7"
 #define TURN_PULSE_CHARACTERISTIC_UUID "8fc09712-72c2-421e-865e-fd5436896cf2"
@@ -37,6 +35,8 @@ const uint8_t turnStates[] = {
     0b00000010,
 };
 
+bool sensorAState = 0;
+bool sensorBState = 0;
 uint8_t currentTurnIndex = 0;
 TurnDirection lastTurnDirection = TurnDirection::NONE;
 uint8_t turnJitterCounter = 0;
@@ -63,40 +63,52 @@ QueueHandle_t debugSensorAQueue;
 QueueHandle_t debugSensorBQueue;
 #endif
 
-static bool IRAM_ATTR
-adcConvDoneCallback(adc_continuous_handle_t handle,
-                    const adc_continuous_evt_data_t *edata, void *user_data) {
+static bool IRAM_ATTR adcConvDoneCallback(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata,
+                                          void *user_data) {
+  uint32_t sensorARaw = 0;
+  uint32_t sensorBRaw = 0;
 
-  uint32_t sensorAState = 0;
-  uint32_t sensorBState = 0;
-
-  int countA = 0;
-  int countB = 0;
+  int sensorASampleCount = 0;
+  int sensorBSampleCount = 0;
 
   for (int i = 0; i < edata->size; i += SOC_ADC_DIGI_RESULT_BYTES) {
-    adc_digi_output_data_t *p =
-        (adc_digi_output_data_t *)&edata->conv_frame_buffer[i];
+    adc_digi_output_data_t *p = (adc_digi_output_data_t *)&edata->conv_frame_buffer[i];
     uint32_t channel = p->type2.channel;
     uint32_t data = p->type2.data;
 
     if (channel == SENSOR_ADC_CHANNEL_A) {
-      sensorAState += data;
-      countA++;
+      sensorARaw += data;
+      sensorASampleCount++;
     } else {
-      sensorBState += data;
-      countB++;
+      sensorBRaw += data;
+      sensorBSampleCount++;
     }
   }
 
-  sensorAState /= countA;
-  sensorBState /= countB;
+  sensorARaw /= sensorASampleCount;
+  sensorBRaw /= sensorBSampleCount;
+
+  if (sensorAState && sensorARaw < 2000) {
+    sensorAState = false;
+  } else if (!sensorAState && sensorARaw > 3000) {
+    sensorAState = true;
+  }
+
+  if (sensorBState && sensorBRaw < 600) {
+    sensorBState = false;
+  } else if (!sensorBState && sensorBRaw > 900) {
+    sensorBState = true;
+  }
 
 #ifdef DEBUG
-  xQueueSendToBackFromISR(debugSensorAQueue, &sensorAState, nullptr);
-  xQueueSendToBackFromISR(debugSensorBQueue, &sensorBState, nullptr);
+  uint32_t sensorADebug = sensorARaw | (sensorAState << 31);
+  uint32_t sensorBDebug = sensorBRaw | (sensorBState << 31);
+
+  xQueueSendToBackFromISR(debugSensorAQueue, &sensorADebug, nullptr);
+  xQueueSendToBackFromISR(debugSensorBQueue, &sensorBDebug, nullptr);
 #endif
 
-  uint8_t currentTurnState = (sensorAState > 500) | ((sensorBState > 250) << 1);
+  uint8_t currentTurnState = sensorAState | (sensorBState << 1);
 
   if (currentTurnState == turnStates[(currentTurnIndex + 1) & 3]) {
     currentTurnIndex++;
@@ -122,9 +134,9 @@ adcConvDoneCallback(adc_continuous_handle_t handle,
     }
     lastTurnDirection = turnDirection;
 
-    if (turnJitterCounter < 3) {
-      xQueueSendToBackFromISR(turnPulseNotifyingQueue, &turnDirection, nullptr);
-    }
+    // if (turnJitterCounter < 2) {
+    xQueueSendToBackFromISR(turnPulseNotifyingQueue, &turnDirection, nullptr);
+    //}
   }
 
   return true;
@@ -132,23 +144,21 @@ adcConvDoneCallback(adc_continuous_handle_t handle,
 
 extern "C" {
 void app_main() {
+  //
   BLEDevice::init("Metrino v1");
 
   btServer = BLEDevice::createServer();
 
   configService = btServer->createService(CONFIG_SERVICE_UUID);
 
-  deviceNameCharacteristic = configService->createCharacteristic(
-      DEVICE_NAME_CHARACTERISTIC_UUID,
-      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  batteryAmountCharacteristic = configService->createCharacteristic(
-      BATTERY_AMOUNT_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ);
-  wheelDiameterCharacteristic = configService->createCharacteristic(
-      WHEEL_DIAMETER_CHARACTERISTIC_UUID,
-      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  wheelDivisionsCharacteristic = configService->createCharacteristic(
-      WHEEL_DIVISIONS_CHARACTERISTIC_UUID,
-      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  deviceNameCharacteristic = configService->createCharacteristic(DEVICE_NAME_CHARACTERISTIC_UUID,
+                                                                 NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  batteryAmountCharacteristic =
+      configService->createCharacteristic(BATTERY_AMOUNT_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ);
+  wheelDiameterCharacteristic = configService->createCharacteristic(WHEEL_DIAMETER_CHARACTERISTIC_UUID,
+                                                                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  wheelDivisionsCharacteristic = configService->createCharacteristic(WHEEL_DIVISIONS_CHARACTERISTIC_UUID,
+                                                                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
 
   /*
   deviceNameCharacteristic->setCallbacks(new ConfigCharacteristicCallbacks());
@@ -161,8 +171,7 @@ void app_main() {
 
   operationService = btServer->createService(OPERATION_SERVICE_UUID);
   turnPulseCharacteristic = operationService->createCharacteristic(
-      TURN_PULSE_CHARACTERISTIC_UUID,
-      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
+      TURN_PULSE_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
   turnPulseCharacteristic->setValue(0);
   operationService->start();
 
@@ -186,7 +195,7 @@ void app_main() {
 
   adc_continuous_handle_cfg_t adc_config = {
       .max_store_buf_size = 1024,
-      .conv_frame_size = 64,
+      .conv_frame_size = 8,
   };
   ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adcDriverHandle));
 
@@ -218,22 +227,19 @@ void app_main() {
   adc_continuous_evt_cbs_t cbs = {
       .on_conv_done = adcConvDoneCallback,
   };
-  ESP_ERROR_CHECK(
-      adc_continuous_register_event_callbacks(adcDriverHandle, &cbs, NULL));
+  ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(adcDriverHandle, &cbs, NULL));
   ESP_ERROR_CHECK(adc_continuous_start(adcDriverHandle));
-
-  ESP_LOGI("dsg", "ah");
 
   while (true) {
 #ifdef DEBUG
-    unsigned int state;
+    unsigned int stateA;
+    unsigned int stateB;
 
-    if (xQueueReceive(debugSensorAQueue, &state, 1000 / portTICK_PERIOD_MS)) {
-      ESP_LOGI("dsg", "sensor A %u", state);
-    }
-
-    if (xQueueReceive(debugSensorBQueue, &state, 1000 / portTICK_PERIOD_MS)) {
-      ESP_LOGI("dsg", "sensor B %u", state);
+    if (xQueueReceive(debugSensorAQueue, &stateA, 1000 / portTICK_PERIOD_MS) &&
+        xQueueReceive(debugSensorBQueue, &stateB, 1000 / portTICK_PERIOD_MS)) {
+      // ESP_LOGI("dsg", "%u", (stateB & 1 << 31) >> 31);
+      ESP_LOGI("dsg", ", %u, %u", stateA & ~(1 << 31), /* (stateA & 1 << 31) >> 31,*/
+               stateB & ~(1 << 31) /*, (stateB & 1 << 31) >> 31*/);
     }
 
     vTaskDelay(1);
@@ -242,9 +248,7 @@ void app_main() {
 
     uint8_t turnDirection;
 
-    if (xQueueReceive(turnPulseNotifyingQueue, &turnDirection,
-                      1000 / portTICK_PERIOD_MS)) {
-      ESP_LOGI("dsg", "ah %x", turnDirection);
+    if (xQueueReceive(turnPulseNotifyingQueue, &turnDirection, 1000 / portTICK_PERIOD_MS)) {
       turnPulseCharacteristic->setValue(turnDirection);
       turnPulseCharacteristic->notify();
     }
