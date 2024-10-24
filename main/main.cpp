@@ -38,8 +38,6 @@ const uint8_t turnStates[] = {
 bool sensorAState = 0;
 bool sensorBState = 0;
 uint8_t currentTurnIndex = 0;
-TurnDirection lastTurnDirection = TurnDirection::NONE;
-uint8_t turnJitterCounter = 0;
 
 BLEServer *btServer;
 BLEService *configService;
@@ -127,16 +125,7 @@ static bool IRAM_ATTR adcConvDoneCallback(adc_continuous_handle_t handle, const 
   }
 
   if (turnDirection != TurnDirection::NONE) {
-    if (turnDirection != lastTurnDirection) {
-      turnJitterCounter++;
-    } else {
-      turnJitterCounter = 0;
-    }
-    lastTurnDirection = turnDirection;
-
-    // if (turnJitterCounter < 2) {
     xQueueSendToBackFromISR(turnPulseNotifyingQueue, &turnDirection, nullptr);
-    //}
   }
 
   return true;
