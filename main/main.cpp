@@ -5,6 +5,7 @@
 #include <esp_sleep.h>
 #include <hal/adc_types.h>
 #include <hal/gpio_hal.h>
+#include <math.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -15,19 +16,13 @@
 #include "led_strip.h"
 #include "soc/soc_caps.h"
 
+// El modo DEBUG permite inspeccionar las mediciones recibidas por el ADC del encoder.
+// Esto puede ser útil a la hora de calibrar el encoder, o diagnosticar problemas de conexionado.
+// Para activar el modo DEBUG descomente la siguiente línea:
+
 // #define DEBUG 1
 
-#define CONFIG_SERVICE_UUID "c22fe686-2ea0-4eb3-8389-d568284e5b10"
-#define DEVICE_NAME_CHARACTERISTIC_UUID "6f5e26b6-5920-4c44-ad4b-3b7893f8ef09"
-#define BATTERY_AMOUNT_CHARACTERISTIC_UUID "0efa935a-9627-4f0b-9e8f-1b86084d2477"
-#define WHEEL_DIAMETER_CHARACTERISTIC_UUID "63a4b587-33e2-49ba-9c8b-cf0ed8989bae"
-#define WHEEL_DIVISIONS_CHARACTERISTIC_UUID "9b04682b-7eb0-449b-bd79-419064a43463"
-
-#define OPERATION_SERVICE_UUID "0331e722-6d35-4922-8c69-f80d0f9fb9e7"
-#define TURN_PULSE_CHARACTERISTIC_UUID "8fc09712-72c2-421e-865e-fd5436896cf2"
-
-#define SENSOR_ADC_CHANNEL_A ADC_CHANNEL_5
-#define SENSOR_ADC_CHANNEL_B ADC_CHANNEL_6
+// ------------ Monitoreo de la batería y LED indicador ------------ //
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_4
 #define STATUS_LED_GPIO GPIO_NUM_48
 
@@ -36,8 +31,15 @@
 #define BATTERY_TRACKED_VOLTAGE_INITIAL 4800
 #define BATTERY_VOLTAGE_ALERT_LEVEL 4200
 #define BATTERY_VOLTAGE_SHUTDOWN_LEVEL 4000
+#define BATTERY_VOLTAGE_MAX_LEVEL 6000
 
-enum TurnDirection { BACKWARD, FORWARD, NONE };
+led_strip_handle_t ledStripHandle;
+adc_oneshot_unit_handle_t batteryAdcHandle;
+adc_cali_handle_t batteryAdcCaliHandle;
+
+// -------------------------- Encoder ------------------------------ //
+#define SENSOR_ADC_CHANNEL_A ADC_CHANNEL_5
+#define SENSOR_ADC_CHANNEL_B ADC_CHANNEL_6
 
 const uint8_t turnStates[] = {
     0b00000000,
@@ -48,24 +50,37 @@ const uint8_t turnStates[] = {
 
 bool sensorAState = 0;
 bool sensorBState = 0;
-uint8_t currentTurnIndex = 0;
+uint8_t currentTurnStateIndex = 0;
+
+adc_continuous_handle_t encoderAdcHandle;
+
+// ------------------- Parámetros editables ------------------------ //
+char *deviceName = "Metrino v1";
+double wheelDiameter = 0.08;
+int wheelSlots = 32;
+
+double currentMeasurement;
+
+// ------------------------ Bluetooth ------------------------------ //
+#define PARAMETER_SERVICE_UUID "c22fe686-2ea0-4eb3-8389-d568284e5b10"
+#define DEVICE_NAME_CHARACTERISTIC_UUID "6f5e26b6-5920-4c44-ad4b-3b7893f8ef09"
+#define BATTERY_AMOUNT_CHARACTERISTIC_UUID "0efa935a-9627-4f0b-9e8f-1b86084d2477"
+#define WHEEL_DIAMETER_CHARACTERISTIC_UUID "63a4b587-33e2-49ba-9c8b-cf0ed8989bae"
+#define WHEEL_DIVISIONS_CHARACTERISTIC_UUID "9b04682b-7eb0-449b-bd79-419064a43463"
+#define OPERATION_SERVICE_UUID "0331e722-6d35-4922-8c69-f80d0f9fb9e7"
+#define MEASUREMENT_CHARACTERISTIC_UUID "8fc09712-72c2-421e-865e-fd5436896cf2"
 
 BLEServer *btServer;
 BLEService *configService;
 BLECharacteristic *deviceNameCharacteristic;
 BLECharacteristic *batteryAmountCharacteristic;
 BLECharacteristic *wheelDiameterCharacteristic;
-BLECharacteristic *wheelDivisionsCharacteristic;
-
+BLECharacteristic *wheelSlotsCharacteristic;
 BLEService *operationService;
-BLECharacteristic *turnPulseCharacteristic;
+BLECharacteristic *measurementCharacteristic;
 
+bool bluetoothInitialized = false;
 uint32_t connectedClientAmount = 0;
-
-led_strip_handle_t ledStripHandle;
-adc_oneshot_unit_handle_t batteryAdcHandle;
-adc_cali_handle_t batteryAdcCaliHandle;
-adc_continuous_handle_t encoderAdcHandle;
 
 class ServerCallbacks : public BLEServerCallbacks {
   using BLEServerCallbacks::onConnect;
@@ -75,18 +90,22 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) { connectedClientAmount--; }
 };
 
-class ConfigCharacteristicCallbacks : public BLECharacteristicCallbacks {
+class MeasurementCharacteristicCallbacks : public BLECharacteristicCallbacks {
   using BLECharacteristicCallbacks::onWrite;
-  void onWrite(BLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) {}
+  void onWrite(BLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) {
+    currentMeasurement = *(double *)pCharacteristic->getValue().data();
+  }
 };
 
-QueueHandle_t turnPulseNotifyingQueue;
+// ------------------------ FreeRTOS ------------------------------- //
+SemaphoreHandle_t measurementUpdateSemaphore;
 
 #ifdef DEBUG
 QueueHandle_t debugSensorAQueue;
 QueueHandle_t debugSensorBQueue;
 #endif
 
+// función llamada cada vez que el ADC del encoder tiene datos nuevos
 static bool IRAM_ATTR adcConvDoneCallback(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata,
                                           void *user_data) {
   uint32_t sensorARaw = 0;
@@ -134,29 +153,31 @@ static bool IRAM_ATTR adcConvDoneCallback(adc_continuous_handle_t handle, const 
 
   uint8_t currentTurnState = sensorAState | (sensorBState << 1);
 
-  if (currentTurnState == turnStates[(currentTurnIndex + 1) & 3]) {
-    currentTurnIndex++;
-  } else if (currentTurnState == turnStates[(currentTurnIndex - 1) & 3]) {
-    currentTurnIndex--;
+  if (currentTurnState == turnStates[(currentTurnStateIndex + 1) & 3]) {
+    currentTurnStateIndex++;
+  } else if (currentTurnState == turnStates[(currentTurnStateIndex - 1) & 3]) {
+    currentTurnStateIndex--;
   }
 
-  TurnDirection turnDirection = TurnDirection::NONE;
+  int turnDirection = 0;
 
-  if (currentTurnIndex == 255) {
-    currentTurnIndex = 3;
-    turnDirection = TurnDirection::BACKWARD;
-  } else if (currentTurnIndex == 4) {
-    currentTurnIndex = 0;
-    turnDirection = TurnDirection::FORWARD;
+  if (currentTurnStateIndex == 255) {
+    currentTurnStateIndex = 3;
+    turnDirection = 1;
+  } else if (currentTurnStateIndex == 4) {
+    currentTurnStateIndex = 0;
+    turnDirection = -1;
   }
 
-  if (turnDirection != TurnDirection::NONE) {
-    xQueueSendToBackFromISR(turnPulseNotifyingQueue, &turnDirection, nullptr);
+  if (turnDirection != 0) {
+    currentMeasurement += turnDirection * M_PI * wheelDiameter / wheelSlots;
+    xSemaphoreGiveFromISR(measurementUpdateSemaphore, 0);
   }
 
   return true;
 }
 
+// hilo dedicado al monitoreo de la batería y la actualización del LED indicador de estado
 void statusLedTask(void *unused) {
   double trackedVoltage = BATTERY_TRACKED_VOLTAGE_INITIAL;
   int rawMeasurement;
@@ -167,8 +188,12 @@ void statusLedTask(void *unused) {
     adc_cali_raw_to_voltage(batteryAdcCaliHandle, rawMeasurement, &voltMeasurement);
     trackedVoltage += (voltMeasurement / BATTERY_VOLTAGE_DIVIDER_RATIO - trackedVoltage) * 0.5;
 
+    if (bluetoothInitialized) {
+      batteryAmountCharacteristic->setValue(trackedVoltage / 1000);
+    }
+
     if (trackedVoltage < BATTERY_VOLTAGE_SHUTDOWN_LEVEL) {
-      led_strip_set_pixel(ledStripHandle, 0, 64, 0, 0);
+      led_strip_set_pixel(ledStripHandle, 0, 32, 0, 0);
       led_strip_refresh(ledStripHandle);
       esp_deep_sleep_start();
     }
@@ -177,7 +202,7 @@ void statusLedTask(void *unused) {
       led_strip_set_pixel(ledStripHandle, 0, 0, 0, 0);
       led_strip_refresh(ledStripHandle);
       vTaskDelay(500 / portTICK_PERIOD_MS);
-      led_strip_set_pixel(ledStripHandle, 0, 0, 0, 64);
+      led_strip_set_pixel(ledStripHandle, 0, 0, 0, 32);
       led_strip_refresh(ledStripHandle);
       vTaskDelay(500 / portTICK_PERIOD_MS);
     } else {
@@ -185,24 +210,23 @@ void statusLedTask(void *unused) {
     }
 
     if (trackedVoltage < BATTERY_VOLTAGE_ALERT_LEVEL) {
-      led_strip_set_pixel(ledStripHandle, 0, 64, 0, 0);
+      led_strip_set_pixel(ledStripHandle, 0, 32, 0, 0);
       led_strip_refresh(ledStripHandle);
       vTaskDelay(50 / portTICK_PERIOD_MS);
       led_strip_set_pixel(ledStripHandle, 0, 0, 0, 0);
       led_strip_refresh(ledStripHandle);
       vTaskDelay(50 / portTICK_PERIOD_MS);
-      led_strip_set_pixel(ledStripHandle, 0, 64, 0, 0);
+      led_strip_set_pixel(ledStripHandle, 0, 32, 0, 0);
       led_strip_refresh(ledStripHandle);
       vTaskDelay(50 / portTICK_PERIOD_MS);
-      led_strip_set_pixel(ledStripHandle, 0, 0, 0, 64);
+      led_strip_set_pixel(ledStripHandle, 0, 0, 0, 32);
       led_strip_refresh(ledStripHandle);
     }
   }
 }
 
+// inicialización del LED indicador de estado y el ADC dedicado a medir la carga de la batería
 void statusLedInit() {
-  // inicialización del LED indicador de estado y el ADC dedicado a medir la carga de la batería
-
   led_strip_config_t ledStripConfig = {
       .strip_gpio_num = STATUS_LED_GPIO,
       .max_leds = 1,
@@ -237,14 +261,13 @@ void statusLedInit() {
   xTaskCreatePinnedToCore(&statusLedTask, "statusLedTask", 2048, NULL, 1, NULL, 0);
 }
 
+// inicialización del servicio Bluetooth
 void bluetoothInit() {
-  // inicialización del servicio Bluetooth
-
-  BLEDevice::init("Metrino v1");
+  BLEDevice::init(deviceName);
 
   btServer = BLEDevice::createServer();
 
-  configService = btServer->createService(CONFIG_SERVICE_UUID);
+  configService = btServer->createService(PARAMETER_SERVICE_UUID);
 
   deviceNameCharacteristic = configService->createCharacteristic(DEVICE_NAME_CHARACTERISTIC_UUID,
                                                                  NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
@@ -252,39 +275,41 @@ void bluetoothInit() {
       configService->createCharacteristic(BATTERY_AMOUNT_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ);
   wheelDiameterCharacteristic = configService->createCharacteristic(WHEEL_DIAMETER_CHARACTERISTIC_UUID,
                                                                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  wheelDivisionsCharacteristic = configService->createCharacteristic(WHEEL_DIVISIONS_CHARACTERISTIC_UUID,
-                                                                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  wheelSlotsCharacteristic = configService->createCharacteristic(WHEEL_DIVISIONS_CHARACTERISTIC_UUID,
+                                                                 NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+
+  deviceNameCharacteristic->setValue((uint8_t *)deviceName, strlen(deviceName));
+  wheelDiameterCharacteristic->setValue(wheelDiameter);
+  wheelSlotsCharacteristic->setValue(wheelSlots);
 
   btServer->setCallbacks(new ServerCallbacks());
-  /*
-  deviceNameCharacteristic->setCallbacks(new ConfigCharacteristicCallbacks());
-  wheelDiameterCharacteristic->setCallbacks(
-      new ConfigCharacteristicCallbacks());
-  wheelDivisionsCharacteristic->setCallbacks(
-      new ConfigCharacteristicCallbacks());*/
 
   configService->start();
 
   operationService = btServer->createService(OPERATION_SERVICE_UUID);
-  turnPulseCharacteristic = operationService->createCharacteristic(
-      TURN_PULSE_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
-  turnPulseCharacteristic->setValue(0);
+
+  measurementCharacteristic = operationService->createCharacteristic(
+      MEASUREMENT_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
+  measurementCharacteristic->setValue(0);
+  measurementCharacteristic->setCallbacks(new MeasurementCharacteristicCallbacks());
+
   operationService->start();
 
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(CONFIG_SERVICE_UUID);
+  pAdvertising->addServiceUUID(PARAMETER_SERVICE_UUID);
   pAdvertising->addServiceUUID(OPERATION_SERVICE_UUID);
   pAdvertising->setScanResponse(true);
   pAdvertising->setMinPreferred(0x06);
   pAdvertising->setMaxPreferred(0x12);
 
   BLEDevice::startAdvertising();
+
+  bluetoothInitialized = true;
 }
 
+// Inicialización del ADC dedicado al encoder
 void encoderInit() {
-  // Inicialización del ADC dedicado al encoder
-
-  turnPulseNotifyingQueue = xQueueCreate(1024, 1);
+  measurementUpdateSemaphore = xSemaphoreCreateBinary();
 
 #ifdef DEBUG
   debugSensorAQueue = xQueueCreate(32, 4);
@@ -331,6 +356,7 @@ void encoderInit() {
 }
 
 extern "C" {
+// hilo principal, encargado de inicializar los subsistemas y enviar la medición
 void app_main() {
   statusLedInit();
   bluetoothInit();
@@ -343,20 +369,17 @@ void app_main() {
 
     if (xQueueReceive(debugSensorAQueue, &stateA, 1000 / portTICK_PERIOD_MS) &&
         xQueueReceive(debugSensorBQueue, &stateB, 1000 / portTICK_PERIOD_MS)) {
-      // ESP_LOGI("dsg", "%u", (stateB & 1 << 31) >> 31);
-      ESP_LOGI("dsg", ", %u, %u", stateA & ~(1 << 31), /* (stateA & 1 << 31) >> 31,*/
-               stateB & ~(1 << 31) /*, (stateB & 1 << 31) >> 31*/);
+      ESP_LOGI("metrino_debug", "%u, %u", stateA & ~(1 << 31), stateB & ~(1 << 31));
     }
 
     vTaskDelay(1);
     continue;
 #endif
 
-    uint8_t turnDirection;
-
-    if (xQueueReceive(turnPulseNotifyingQueue, &turnDirection, 1000 / portTICK_PERIOD_MS)) {
-      turnPulseCharacteristic->setValue(turnDirection);
-      turnPulseCharacteristic->notify();
+    if (xSemaphoreTake(measurementUpdateSemaphore, portMAX_DELAY)) {
+      measurementCharacteristic->setValue(currentMeasurement);
+      measurementCharacteristic->notify();
+      vTaskDelay(16 / portTICK_PERIOD_MS);
     }
   }
 }

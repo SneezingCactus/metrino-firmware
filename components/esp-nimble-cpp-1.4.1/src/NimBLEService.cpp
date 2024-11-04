@@ -229,15 +229,11 @@ bool NimBLEService::start() {
         m_pSvcDef = svc;
     }
 
-    ESP_LOGI("sdg", "fucj");
-
     int rc = ble_gatts_count_cfg((const ble_gatt_svc_def*)m_pSvcDef);
     if (rc != 0) {
         NIMBLE_LOGE(LOG_TAG, "ble_gatts_count_cfg failed, rc= %d, %s", rc, NimBLEUtils::returnCodeToString(rc));
         return false;
     }
-
-    ESP_LOGI("sdg", "Jeusus");
 
     rc = ble_gatts_add_svcs((const ble_gatt_svc_def*)m_pSvcDef);
     if (rc != 0) {
