@@ -6,6 +6,8 @@
 #include <hal/adc_types.h>
 #include <hal/gpio_hal.h>
 #include <math.h>
+#include <nvs.h>
+#include <nvs_flash.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -52,14 +54,21 @@ bool sensorAState = 0;
 bool sensorBState = 0;
 uint8_t currentTurnStateIndex = 0;
 
+double currentMeasurement;
+
 adc_continuous_handle_t encoderAdcHandle;
 
 // ------------------- Parámetros editables ------------------------ //
-char *deviceName = "Metrino v1";
-double wheelDiameter = 0.08;
-int wheelSlots = 32;
 
-double currentMeasurement;
+#define DEFAULT_PARAM_DEVICE_NAME "Metrino v1"
+#define DEFAULT_PARAM_WHEEL_DIAMETER 0.08
+#define DEFAULT_PARAM_WHEEL_SLOTS 32
+
+char *deviceName;
+double wheelDiameter;
+uint32_t wheelSlots;
+
+nvs_handle_t nvsHandle;
 
 // ------------------------ Bluetooth ------------------------------ //
 #define PARAMETER_SERVICE_UUID "c22fe686-2ea0-4eb3-8389-d568284e5b10"
@@ -69,15 +78,23 @@ double currentMeasurement;
 #define WHEEL_DIVISIONS_CHARACTERISTIC_UUID "9b04682b-7eb0-449b-bd79-419064a43463"
 #define OPERATION_SERVICE_UUID "0331e722-6d35-4922-8c69-f80d0f9fb9e7"
 #define MEASUREMENT_CHARACTERISTIC_UUID "8fc09712-72c2-421e-865e-fd5436896cf2"
+#define ACTION_CHARACTERISTIC_UUID "58a0d3a8-2987-4a42-b452-3d43b088c157"
+
+enum DeviceActions {
+  IDLE,
+  RESTART,
+  APPLY_PARAMS,
+};
 
 BLEServer *btServer;
-BLEService *configService;
-BLECharacteristic *deviceNameCharacteristic;
-BLECharacteristic *batteryAmountCharacteristic;
-BLECharacteristic *wheelDiameterCharacteristic;
-BLECharacteristic *wheelSlotsCharacteristic;
+BLEService *paramService;
+BLECharacteristic *deviceNameCha;
+BLECharacteristic *batteryAmountCha;
+BLECharacteristic *wheelDiameterCha;
+BLECharacteristic *wheelSlotsCha;
 BLEService *operationService;
-BLECharacteristic *measurementCharacteristic;
+BLECharacteristic *measurementCha;
+BLECharacteristic *actionCha;
 
 bool bluetoothInitialized = false;
 uint32_t connectedClientAmount = 0;
@@ -90,10 +107,46 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) { connectedClientAmount--; }
 };
 
-class MeasurementCharacteristicCallbacks : public BLECharacteristicCallbacks {
+class DeviceNameChaCallbacks : public BLECharacteristicCallbacks {
+  using BLECharacteristicCallbacks::onWrite;
+  void onWrite(BLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) {
+    nvs_set_str(nvsHandle, "deviceName", pCharacteristic->getValue().c_str());
+  }
+};
+
+class WheelDiameterChaCallbacks : public BLECharacteristicCallbacks {
+  using BLECharacteristicCallbacks::onWrite;
+  void onWrite(BLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) {
+    nvs_set_u64(nvsHandle, "wheelDiameter", *(uint64_t *)pCharacteristic->getValue().data());
+  }
+};
+
+class WheelSlotsChaCallbacks : public BLECharacteristicCallbacks {
+  using BLECharacteristicCallbacks::onWrite;
+  void onWrite(BLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) {
+    nvs_set_u32(nvsHandle, "wheelSlots", *(uint32_t *)pCharacteristic->getValue().data());
+  }
+};
+
+class MeasurementChaCallbacks : public BLECharacteristicCallbacks {
   using BLECharacteristicCallbacks::onWrite;
   void onWrite(BLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) {
     currentMeasurement = *(double *)pCharacteristic->getValue().data();
+  }
+};
+
+class ActionChaCallbacks : public BLECharacteristicCallbacks {
+  using BLECharacteristicCallbacks::onWrite;
+  void onWrite(BLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) {
+    switch (*pCharacteristic->getValue().data()) {
+      case DeviceActions::RESTART:
+        btServer->disconnect(desc->conn_handle);
+        esp_restart();
+        break;
+      case DeviceActions::APPLY_PARAMS:
+        nvs_commit(nvsHandle);
+        break;
+    }
   }
 };
 
@@ -144,11 +197,8 @@ static bool IRAM_ATTR adcConvDoneCallback(adc_continuous_handle_t handle, const 
   }
 
 #ifdef DEBUG
-  uint32_t sensorADebug = sensorARaw | (sensorAState << 31);
-  uint32_t sensorBDebug = sensorBRaw | (sensorBState << 31);
-
-  xQueueSendToBackFromISR(debugSensorAQueue, &sensorADebug, nullptr);
-  xQueueSendToBackFromISR(debugSensorBQueue, &sensorBDebug, nullptr);
+  xQueueSendToBackFromISR(debugSensorAQueue, &sensorARaw, nullptr);
+  xQueueSendToBackFromISR(debugSensorBQueue, &sensorBRaw, nullptr);
 #endif
 
   uint8_t currentTurnState = sensorAState | (sensorBState << 1);
@@ -186,10 +236,10 @@ void statusLedTask(void *unused) {
   while (true) {
     adc_oneshot_read(batteryAdcHandle, BATTERY_ADC_CHANNEL, &rawMeasurement);
     adc_cali_raw_to_voltage(batteryAdcCaliHandle, rawMeasurement, &voltMeasurement);
-    trackedVoltage += (voltMeasurement / BATTERY_VOLTAGE_DIVIDER_RATIO - trackedVoltage) * 0.5;
+    trackedVoltage += (voltMeasurement / BATTERY_VOLTAGE_DIVIDER_RATIO - trackedVoltage) / 2;
 
     if (bluetoothInitialized) {
-      batteryAmountCharacteristic->setValue(trackedVoltage / 1000);
+      batteryAmountCha->setValue(trackedVoltage / 1000);
     }
 
     if (trackedVoltage < BATTERY_VOLTAGE_SHUTDOWN_LEVEL) {
@@ -261,37 +311,86 @@ void statusLedInit() {
   xTaskCreatePinnedToCore(&statusLedTask, "statusLedTask", 2048, NULL, 1, NULL, 0);
 }
 
+// inicialización de los parámetros guardados en la memoria flash
+void paramInit() {
+  esp_err_t err = nvs_flash_init();
+
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    // si la partición de NVS está llena o la versión de NVS que proporciona la versión actual de ESP-IDF es más nueva
+    // que la inicializada en la flash, ésta debe ser formateada antes de ser usada
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    err = nvs_flash_init();
+  }
+
+  ESP_ERROR_CHECK(err);
+
+  ESP_ERROR_CHECK(nvs_open("metrino_storage", NVS_READWRITE, &nvsHandle));
+
+  err = nvs_find_key(nvsHandle, "deviceName", nullptr);
+
+  if (err == ESP_ERR_NVS_NOT_FOUND) {
+    // si todavía no existen los parámetros en la flash, grabar los valores default
+    nvs_set_str(nvsHandle, "deviceName", DEFAULT_PARAM_DEVICE_NAME);
+    nvs_set_u64(nvsHandle, "wheelDiameter", std::bit_cast<uint64_t>(DEFAULT_PARAM_WHEEL_DIAMETER));
+    nvs_set_u32(nvsHandle, "wheelSlots", DEFAULT_PARAM_WHEEL_SLOTS);
+
+    nvs_commit(nvsHandle);
+
+    deviceName = DEFAULT_PARAM_DEVICE_NAME;
+    wheelDiameter = DEFAULT_PARAM_WHEEL_DIAMETER;
+    wheelSlots = DEFAULT_PARAM_WHEEL_SLOTS;
+  } else if (err == ESP_OK) {
+    size_t requiredSize;
+    nvs_get_str(nvsHandle, "deviceName", nullptr, &requiredSize);
+    deviceName = (char *)malloc(requiredSize);
+
+    nvs_get_str(nvsHandle, "deviceName", deviceName, &requiredSize);
+    nvs_get_u64(nvsHandle, "wheelDiameter", (uint64_t *)&wheelDiameter);
+    nvs_get_u32(nvsHandle, "wheelSlots", &wheelSlots);
+  }
+}
+
 // inicialización del servicio Bluetooth
 void bluetoothInit() {
   BLEDevice::init(deviceName);
 
   btServer = BLEDevice::createServer();
 
-  configService = btServer->createService(PARAMETER_SERVICE_UUID);
+  // parameter service init
+  paramService = btServer->createService(PARAMETER_SERVICE_UUID);
 
-  deviceNameCharacteristic = configService->createCharacteristic(DEVICE_NAME_CHARACTERISTIC_UUID,
-                                                                 NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  batteryAmountCharacteristic =
-      configService->createCharacteristic(BATTERY_AMOUNT_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ);
-  wheelDiameterCharacteristic = configService->createCharacteristic(WHEEL_DIAMETER_CHARACTERISTIC_UUID,
-                                                                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  wheelSlotsCharacteristic = configService->createCharacteristic(WHEEL_DIVISIONS_CHARACTERISTIC_UUID,
-                                                                 NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  deviceNameCha = paramService->createCharacteristic(DEVICE_NAME_CHARACTERISTIC_UUID,
+                                                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  batteryAmountCha = paramService->createCharacteristic(BATTERY_AMOUNT_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ);
+  wheelDiameterCha = paramService->createCharacteristic(WHEEL_DIAMETER_CHARACTERISTIC_UUID,
+                                                        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+  wheelSlotsCha = paramService->createCharacteristic(WHEEL_DIVISIONS_CHARACTERISTIC_UUID,
+                                                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
 
-  deviceNameCharacteristic->setValue((uint8_t *)deviceName, strlen(deviceName));
-  wheelDiameterCharacteristic->setValue(wheelDiameter);
-  wheelSlotsCharacteristic->setValue(wheelSlots);
+  deviceNameCha->setValue((uint8_t *)deviceName, strlen(deviceName));
+  wheelDiameterCha->setValue(wheelDiameter);
+  wheelSlotsCha->setValue(wheelSlots);
 
   btServer->setCallbacks(new ServerCallbacks());
+  deviceNameCha->setCallbacks(new DeviceNameChaCallbacks());
+  wheelDiameterCha->setCallbacks(new WheelDiameterChaCallbacks());
+  wheelSlotsCha->setCallbacks(new WheelSlotsChaCallbacks());
 
-  configService->start();
+  paramService->start();
 
+  // operation service init
   operationService = btServer->createService(OPERATION_SERVICE_UUID);
 
-  measurementCharacteristic = operationService->createCharacteristic(
+  measurementCha = operationService->createCharacteristic(
       MEASUREMENT_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
-  measurementCharacteristic->setValue(0);
-  measurementCharacteristic->setCallbacks(new MeasurementCharacteristicCallbacks());
+  actionCha = operationService->createCharacteristic(
+      ACTION_CHARACTERISTIC_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+
+  measurementCha->setValue(0);
+  actionCha->setValue(0);
+
+  measurementCha->setCallbacks(new MeasurementChaCallbacks());
+  actionCha->setCallbacks(new ActionChaCallbacks());
 
   operationService->start();
 
@@ -307,7 +406,7 @@ void bluetoothInit() {
   bluetoothInitialized = true;
 }
 
-// Inicialización del ADC dedicado al encoder
+// inicialización del ADC dedicado al encoder
 void encoderInit() {
   measurementUpdateSemaphore = xSemaphoreCreateBinary();
 
@@ -359,6 +458,7 @@ extern "C" {
 // hilo principal, encargado de inicializar los subsistemas y enviar la medición
 void app_main() {
   statusLedInit();
+  paramInit();
   bluetoothInit();
   encoderInit();
 
@@ -369,7 +469,7 @@ void app_main() {
 
     if (xQueueReceive(debugSensorAQueue, &stateA, 1000 / portTICK_PERIOD_MS) &&
         xQueueReceive(debugSensorBQueue, &stateB, 1000 / portTICK_PERIOD_MS)) {
-      ESP_LOGI("metrino_debug", "%u, %u", stateA & ~(1 << 31), stateB & ~(1 << 31));
+      ESP_LOGI("metrino_debug", "%u, %u", stateA, stateB);
     }
 
     vTaskDelay(1);
@@ -377,8 +477,8 @@ void app_main() {
 #endif
 
     if (xSemaphoreTake(measurementUpdateSemaphore, portMAX_DELAY)) {
-      measurementCharacteristic->setValue(currentMeasurement);
-      measurementCharacteristic->notify();
+      measurementCha->setValue(currentMeasurement);
+      measurementCha->notify();
       vTaskDelay(16 / portTICK_PERIOD_MS);
     }
   }
